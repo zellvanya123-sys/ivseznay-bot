@@ -329,19 +329,29 @@ def main_menu(total: int = COUNTER_SEED):
 
 def who_menu():
     builder = InlineKeyboardBuilder()
-    builder.button(text="Парень / муж", callback_data="who_boyfriend")
-    builder.button(text="Подруга",       callback_data="who_friend")
-    builder.button(text="Коллега",       callback_data="who_colleague")
-    builder.button(text="Другой",        callback_data="who_other")
+    builder.button(text="Мой парень",           callback_data="who_boyfriend")
+    builder.button(text="Муж / живём вместе",   callback_data="who_husband")
+    builder.button(text="Нравится, не вместе",  callback_data="who_crush")
+    builder.button(text="Бывший",               callback_data="who_ex")
+    builder.button(text="Подруга",              callback_data="who_friend")
+    builder.button(text="Коллега",              callback_data="who_colleague")
+    builder.button(text="Начальник",            callback_data="who_boss")
+    builder.button(text="Другой",               callback_data="who_other")
     builder.adjust(2)
     return builder.as_markup()
 
 def concern_menu():
     builder = InlineKeyboardBuilder()
-    builder.button(text="Чувствую ложь",  callback_data="concern_lie")
-    builder.button(text="Манипуляции",    callback_data="concern_manipulation")
-    builder.button(text="Стал холоднее",  callback_data="concern_cold")
-    builder.button(text="Другое",         callback_data="concern_other")
+    builder.button(text="Чувствую ложь",              callback_data="concern_lie")
+    builder.button(text="Манипулирует мной",          callback_data="concern_manipulation")
+    builder.button(text="Стал холоднее",              callback_data="concern_cold")
+    builder.button(text="Пропал / не отвечает",       callback_data="concern_ghost")
+    builder.button(text="Боюсь что изменяет",         callback_data="concern_cheat")
+    builder.button(text="Что-то скрывает",            callback_data="concern_hiding")
+    builder.button(text="Хочу вернуть его интерес",   callback_data="concern_interest")
+    builder.button(text="Хочу чтобы я ему нравилась", callback_data="concern_attract")
+    builder.button(text="Не понимаю как себя вести",  callback_data="concern_confused")
+    builder.button(text="Другое",                     callback_data="concern_other")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -429,10 +439,14 @@ async def choose_gender(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("who_"))
 async def choose_who(callback: CallbackQuery, state: FSMContext):
     who_map = {
-        "who_boyfriend": "парень/муж",
+        "who_boyfriend": "мой парень",
+        "who_husband":   "муж / живём вместе",
+        "who_crush":     "нравится, но не вместе",
+        "who_ex":        "бывший",
         "who_friend":    "подруга",
         "who_colleague": "коллега",
-        "who_other":     "другой человек"
+        "who_boss":      "начальник",
+        "who_other":     "другой человек",
     }
     await state.update_data(who=who_map.get(callback.data, "другой человек"))
     await callback.message.answer("Что беспокоит?", reply_markup=concern_menu())
@@ -443,9 +457,15 @@ async def choose_who(callback: CallbackQuery, state: FSMContext):
 async def choose_concern(callback: CallbackQuery, state: FSMContext):
     concern_map = {
         "concern_lie":          "чувствую ложь",
-        "concern_manipulation": "манипуляции",
+        "concern_manipulation": "манипулирует мной",
         "concern_cold":         "стал холоднее",
-        "concern_other":        "другое"
+        "concern_ghost":        "пропал / не отвечает",
+        "concern_cheat":        "боюсь что изменяет",
+        "concern_hiding":       "что-то скрывает",
+        "concern_interest":     "хочу вернуть его интерес",
+        "concern_attract":      "хочу чтобы я ему нравилась",
+        "concern_confused":     "не понимаю как себя вести",
+        "concern_other":        "другое",
     }
     await state.update_data(concern=concern_map.get(callback.data, "другое"))
     await state.set_state(AnalysisState.waiting_for_material)
@@ -670,7 +690,20 @@ async def analyze_video_note(message: Message, state: FSMContext):
 
 @dp.message(AnalysisState.post_analysis, F.text)
 async def post_analysis_chat(message: Message, state: FSMContext):
+    # Явно удерживаем состояние — защита от случайного сброса
+    await state.set_state(AnalysisState.post_analysis)
     data = await state.get_data()
+
+    # Если контекст потерян после рестарта Railway — мягко предлагаем начать заново
+    if not data.get("last_analysis"):
+        await message.answer(
+            "Потеряла контекст после перезапуска — бывает.\n\n"
+            "Нажми «Начать анализ» и скинь переписку заново.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        return
+
     await message.answer("Думаю...")
     try:
         response = await claude.messages.create(
@@ -692,8 +725,11 @@ async def post_analysis_chat(message: Message, state: FSMContext):
             ]
         )
         result = clean_markdown(response.content[0].text)
+        # Явно переустанавливаем состояние — чтобы следующий вопрос тоже работал
+        await state.set_state(AnalysisState.post_analysis)
         await send_long(message, result, reply_markup=after_menu(data.get("who", "")))
     except Exception as e:
+        await state.set_state(AnalysisState.post_analysis)
         await message.answer(f"Ошибка. Попробуй ещё раз.\n\nТехнически: {e}")
 
 

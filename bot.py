@@ -476,7 +476,7 @@ def who_menu(user_gender: str = "female"):
         builder.button(text="Жена / живём вместе",  callback_data="who_wife")
         builder.button(text="Нравится, не вместе",  callback_data="who_crush")
         builder.button(text="Бывшая",               callback_data="who_ex")
-        builder.button(text="Друг",                 callback_data="who_friend")
+        builder.button(text="Подруга",              callback_data="who_friend")
         builder.button(text="Коллега",              callback_data="who_colleague")
         builder.button(text="Начальница",           callback_data="who_boss")
         builder.button(text="Другой",               callback_data="who_other")
@@ -627,7 +627,7 @@ async def choose_who(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     gender = data.get("user_gender", "female")
     ex_label      = "бывшая"     if gender == "male" else "бывший"
-    friend_label  = "друг"       if gender == "male" else "подруга"
+    friend_label  = "подруга"   if gender == "male" else "подруга"
     boss_label    = "начальница" if gender == "male" else "начальник"
     who_map = {
         "who_boyfriend": "мой парень",
@@ -704,10 +704,8 @@ async def ask_question_cb(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
-    current = await state.get_state()
-    if current != AnalysisState.post_analysis:
-        await state.set_state(AnalysisState.post_analysis)
-    await callback.message.answer("Задавай — я в контексте, отвечу.")
+    await state.set_state(AnalysisState.post_analysis)
+    await callback.message.answer("Задавай вопрос по этому анализу.")
     await callback.answer()
 
 
@@ -813,7 +811,7 @@ async def _download_photo(file_id: str) -> str:
 
 
 async def _flush_album(mgid: str):
-    """Ждёт 1.2с пока придут все фото альбома, потом анализирует их все вместе."""
+    """Ждёт 1.2с пока придут все фото альбома, потом анализирует каждое отдельно."""
     await asyncio.sleep(1.2)
     info = _album_pending.pop(mgid, None)
     if not info:
@@ -822,45 +820,40 @@ async def _flush_album(mgid: str):
     message: Message = info["message"]
     state: FSMContext = info["state"]
     data: dict      = info["data"]
-    photo_ids: list = info["photo_ids"][:5]  # максимум 5 фото за раз
+    photo_ids: list = info["photo_ids"][:5]
     force_side = info.get("force_side")
 
     n = len(photo_ids)
-    if n == 1:
-        noun = "скриншот"
-    elif 2 <= n <= 4:
-        noun = f"{n} скриншота"
-    else:
-        noun = f"{n} скриншотов"
-    await message.answer(f"Разбираю {noun}...")
-
-    try:
-        images_b64 = []
-        for fid in photo_ids:
-            try:
-                images_b64.append(await _download_photo(fid))
-            except Exception:
-                pass
-
-        if not images_b64:
-            await message.answer("Не получилось скачать скрины. Попробуй по одному.")
-            return
-
-        extra = f"\nДополнительный контекст: {message.caption}" if message.caption else ""
-        await _run_analysis(
-            message, state,
-            who=data.get("who", "этот человек"),
-            concern=data.get("concern", "подозрительное поведение"),
-            material_label=(
-                f"На {noun} — переписка в хронологическом порядке. "
-                f"Прочитай все сообщения на всех изображениях.\n"
-            ),
-            material=extra,
-            images_b64=images_b64,
-            side=force_side or "right"
+    if n > 1:
+        await message.answer(
+            f"⚠️ В альбоме {n} фото. "
+            f"Все будут разобраны как один человек.\n"
+            f"Если хочешь разобрать разных — отправь их по отдельности."
         )
-    except Exception as e:
-        await message.answer(friendly_error(e))
+
+    for i, fid in enumerate(photo_ids, 1):
+        try:
+            image_b64 = await _download_photo(fid)
+        except Exception:
+            continue
+
+        extra = f"\nДополнительный контекст: {message.caption}" if message.caption and i == 1 else ""
+        if n > 1:
+            await message.answer(f"Разбираю {i} из {n}...")
+        
+        try:
+            await _run_analysis(
+                message, state,
+                who=data.get("who", "этот человек"),
+                concern=data.get("concern", "подозрительное поведение"),
+                material_label="На скриншоте переписка. Прочитай все сообщения.\n",
+                material=extra,
+                image_b64=image_b64,
+                side=force_side or "right"
+            )
+        except Exception as e:
+            await message.answer(friendly_error(e))
+            break
 
 
 async def _run_analysis(message: Message, state: FSMContext,
@@ -1030,12 +1023,11 @@ async def post_analysis_chat(message: Message, state: FSMContext):
     await state.set_state(AnalysisState.post_analysis)
     data = await state.get_data()
 
-    # Если контекст потерян после рестарта Railway — мягко предлагаем начать заново
+    # Если контекст потерян после рестарта Railway — предлагаем написать в поддержку
     if not data.get("last_analysis"):
         await message.answer(
-            "Потеряла контекст после перезапуска — бывает.\n\n"
-            "Нажми «Начать анализ» и скинь переписку заново.",
-            reply_markup=main_menu()
+            "Потеряла контекст после перезапуска.\n\n"
+            "Напиши вопрос сюда — @zellvany1"
         )
         await state.clear()
         return

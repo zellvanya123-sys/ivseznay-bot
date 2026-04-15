@@ -713,7 +713,11 @@ async def chatid_cmd(message: Message):
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: Message):
-    if message.from_user.id != int(os.getenv("ADMIN_ID", "0")):
+    admin_id = os.getenv("ADMIN_ID")
+    if not admin_id:
+        await message.answer("ADMIN_ID не настроен. Напиши @zellvany1")
+        return
+    if message.from_user.id != int(admin_id):
         await message.answer("Эта команда только для администратора.")
         return
     

@@ -700,7 +700,19 @@ async def choose_gender(callback: CallbackQuery, state: FSMContext):
     }
     gender = gender_map.get(callback.data, "female")
     await state.update_data(user_gender=gender)
-    await callback.message.answer("Кого будем разбирать?", reply_markup=who_menu(gender))
+    
+    # Проверяем есть ли pending фото
+    user_id = callback.from_user.id
+    has_pending = user_id in _pending_photos and _pending_photos[user_id]
+    
+    if has_pending:
+        n = len(_pending_photos[user_id])
+        await callback.message.answer(
+            f"Запомнила {n} скрин(а). Кого будем разбирать?",
+            reply_markup=who_menu(gender)
+        )
+    else:
+        await callback.message.answer("Кого будем разбирать?", reply_markup=who_menu(gender))
     await callback.answer()
 
 
@@ -749,24 +761,45 @@ async def choose_concern(callback: CallbackQuery, state: FSMContext):
     await state.update_data(concern=concern_map.get(callback.data, "другое"))
     await state.set_state(AnalysisState.waiting_for_material)
 
-    # Если до онбординга пользователь уже скинул скрин — анализируем сразу
-    pending_fid = _pending_photos.pop(callback.from_user.id, None)
-    if pending_fid:
-        await callback.message.answer("Анализирую скрин, который ты скинул(а)...")
-        fresh = await state.get_data()
-        try:
-            image_b64 = await _download_photo(pending_fid)
-            await _run_analysis(
-                callback.message, state,
-                who=fresh.get("who", "этот человек"),
-                concern=fresh.get("concern", "подозрительное поведение"),
-                material_label="На скриншоте переписка. Прочитай все сообщения.\n",
-                material="",
-                image_b64=image_b64
-            )
-        except Exception as e:
-            await callback.message.answer(friendly_error(e))
-        await callback.answer()
+    # Если до онбординга пользователь уже скинул скрин(ы) — анализируем сразу
+    user_id = callback.from_user.id
+    pending_photos = _pending_photos.pop(user_id, None)
+    
+    if pending_photos:
+        if isinstance(pending_photos, str):
+            pending_photos = [pending_photos]
+        
+        n = len(pending_photos)
+        if n == 1:
+            await callback.message.answer("Анализирую скрин...")
+            fresh = await state.get_data()
+            try:
+                image_b64 = await _download_photo(pending_photos[0])
+                await _run_analysis(
+                    callback.message, state,
+                    who=fresh.get("who", "этот человек"),
+                    concern=fresh.get("concern", "подозрительное поведение"),
+                    material_label="На скриншоте переписка. Прочитай все сообщения.\n",
+                    material="",
+                    image_b64=image_b64
+                )
+            except Exception as e:
+                await callback.message.answer(friendly_error(e))
+            await callback.answer()
+        else:
+            # Несколько фото — запускаем группировку
+            await callback.message.answer(f"Анализирую {n} скриншотов...")
+            _single_photo_pending[user_id] = {
+                "photo_ids":  pending_photos,
+                "state":      state,
+                "message":    callback.message,
+                "data":       await state.get_data(),
+                "force_side": "right",
+                "caption":    None,
+                "task":       None,
+                "time":       time.time(),
+            }
+            _single_photo_pending[user_id]["task"] = asyncio.create_task(_flush_single_photos(user_id))
         return
 
     await callback.message.answer(
@@ -1495,12 +1528,23 @@ async def fallback(message: Message, state: FSMContext):
 
         # Фото без стейта — запоминаем и запускаем онбординг
         if message.photo:
-            _pending_photos[message.from_user.id] = message.photo[-1].file_id
-            await message.answer(
-                "Вижу скрин — сейчас разберём.\n\n"
-                "Потеряла контекст после перезапуска, нужно уточнить пару вещей.",
-                reply_markup=gender_menu()
-            )
+            user_id = message.from_user.id
+            is_first = user_id not in _pending_photos or not _pending_photos[user_id]
+            
+            if user_id not in _pending_photos:
+                _pending_photos[user_id] = []
+            
+            _pending_photos[user_id].append(message.photo[-1].file_id)
+            
+            if is_first:
+                await message.answer(
+                    "Вижу скрин — сейчас разберём.\n\n"
+                    "Потеряла контекст после перезапуска, нужно уточнить пару вещей.",
+                    reply_markup=gender_menu()
+                )
+            else:
+                n = len(_pending_photos[user_id])
+                await message.answer(f"Скрин {n} запомнила. Выбери пол и кого разбираем.")
             return
 
         await message.answer(

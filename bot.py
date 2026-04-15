@@ -811,7 +811,7 @@ async def _download_photo(file_id: str) -> str:
 
 
 async def _flush_album(mgid: str):
-    """Ждёт 1.2с пока придут все фото альбома, потом анализирует каждое отдельно."""
+    """Ждёт 1.2с пока придут все фото альбома, потом анализирует их вместе."""
     await asyncio.sleep(1.2)
     info = _album_pending.pop(mgid, None)
     if not info:
@@ -830,30 +830,34 @@ async def _flush_album(mgid: str):
             f"Все будут разобраны как один человек.\n"
             f"Если хочешь разобрать разных — отправь их по отдельности."
         )
+        await message.answer("Разбираю все фото вместе...")
+    else:
+        await message.answer("Разбираю скриншот...")
 
-    for i, fid in enumerate(photo_ids, 1):
-        try:
-            image_b64 = await _download_photo(fid)
-        except Exception:
-            continue
+    try:
+        images_b64 = []
+        for fid in photo_ids:
+            try:
+                images_b64.append(await _download_photo(fid))
+            except Exception:
+                pass
 
-        extra = f"\nДополнительный контекст: {message.caption}" if message.caption and i == 1 else ""
-        if n > 1:
-            await message.answer(f"Разбираю {i} из {n}...")
-        
-        try:
-            await _run_analysis(
-                message, state,
-                who=data.get("who", "этот человек"),
-                concern=data.get("concern", "подозрительное поведение"),
-                material_label="На скриншоте переписка. Прочитай все сообщения.\n",
-                material=extra,
-                image_b64=image_b64,
-                side=force_side or "right"
-            )
-        except Exception as e:
-            await message.answer(friendly_error(e))
-            break
+        if not images_b64:
+            await message.answer("Не получилось скачать скрины. Попробуй по одному.")
+            return
+
+        extra = f"\nДополнительный контекст: {message.caption}" if message.caption else ""
+        await _run_analysis(
+            message, state,
+            who=data.get("who", "этот человек"),
+            concern=data.get("concern", "подозрительное поведение"),
+            material_label=f"На {n} скриншоте(ах) — переписка в хронологическом порядке. Прочитай все.\n",
+            material=extra,
+            images_b64=images_b64,
+            side=force_side or "right"
+        )
+    except Exception as e:
+        await message.answer(friendly_error(e))
 
 
 async def _run_analysis(message: Message, state: FSMContext,

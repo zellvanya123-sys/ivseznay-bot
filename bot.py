@@ -198,6 +198,9 @@ _album_pending: dict[str, dict] = {}  # media_group_id → {photo_ids, state, me
 # ─── ГРУППИРОВКА ОДИНОЧНЫХ ФОТО (отправлены по очереди) ─────────────────────
 _single_photo_pending: dict[int, dict] = {}  # user_id → {photo_ids, state, message, data, task, time}
 
+# ─── ГРУППИРОВКА ТЕКСТА ──────────────────────────────────────────────────────
+_text_pending: dict[int, dict] = {}  # user_id → {texts, state, message, data, task, time}
+
 # ─── ОТЛОЖЕННЫЕ ФОТО (пришли до/после рестарта, без стейта) ──────────────────
 _pending_photos: dict[int, str] = {}  # user_id → file_id последнего фото
 
@@ -413,10 +416,11 @@ async def send_long(message: Message, text: str, **kwargs):
 
 async def transcribe_audio(file_bytes: bytes, filename: str) -> str:
     if not openai_client:
-        raise RuntimeError("Голосовые не настроены. Добавь OPENAI_API_KEY.")
+        raise RuntimeError("Голосовые не настроены. Напиши @zellvany1")
+    
     buf = io.BytesIO(file_bytes)
     buf.seek(0)
-    ext = filename.rsplit(".", 1)[-1] if "." in filename else "ogg"
+    
     try:
         transcript = await openai_client.audio.transcriptions.create(
             model="whisper-1",
@@ -424,10 +428,15 @@ async def transcribe_audio(file_bytes: bytes, filename: str) -> str:
         )
         return transcript.text
     except openai.RateLimitError:
-        raise RuntimeError(
-            "На аккаунте OpenAI закончились кредиты. "
-            "Зайди на platform.openai.com → Billing."
-        )
+        raise RuntimeError("На аккаунте OpenAI закончились кредиты. Зайди на platform.openai.com → Billing.")
+    except openai.AuthenticationError:
+        raise RuntimeError("Проблема с API ключом. Напиши @zellvany1")
+    except openai.APIStatusError as e:
+        if e.status_code == 400:
+            raise RuntimeError("Не удалось расшифровать голосовое. Попробуй ещё раз или напиши текстом.")
+        raise RuntimeError(f"Ошибка сервиса ({e.status_code}). Попробуй через минуту.")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось расшифровать. Напиши текстом.")
 
 
 async def analyze_with_claude(who: str, concern: str, material_label: str,
@@ -1034,19 +1043,69 @@ async def analyze_text(message: Message, state: FSMContext):
         )
         await state.clear()
         return
+
+    user_id = message.from_user.id
+    now = time.time()
+
+    # Группируем текст в течение 3 сек
+    if user_id in _text_pending:
+        pending = _text_pending[user_id]
+        prev = pending.get("task")
+        if prev and not prev.done():
+            prev.cancel()
+        pending["texts"].append(message.text)
+        pending["time"] = now
+        pending["task"] = asyncio.create_task(_flush_text(user_id))
+        return
+
+    # Первое сообщение — запускаем таймер
     if len(message.text) > 8000:
         await message.answer(
             "Переписка слишком длинная — скопируй самый важный кусок (последние 30-50 сообщений)."
         )
         return
-    await message.answer("Анализирую...")
-    await _run_analysis(
-        message, state,
-        who=data.get("who", "этот человек"),
-        concern=data.get("concern", "подозрительное поведение"),
-        material_label="Переписка:\n",
-        material=message.text
-    )
+
+    _text_pending[user_id] = {
+        "texts":  [message.text],
+        "state":  state,
+        "message": message,
+        "data":   data,
+        "task":   None,
+        "time":   now,
+    }
+    _text_pending[user_id]["task"] = asyncio.create_task(_flush_text(user_id))
+
+
+async def _flush_text(user_id: int):
+    """Ждём 3 сек пока придут все текстовые сообщения, потом анализируем вместе."""
+    await asyncio.sleep(3)
+    info = _text_pending.pop(user_id, None)
+    if not info:
+        return
+
+    message: Message = info["message"]
+    state: FSMContext = info["state"]
+    data: dict = info["data"]
+    texts: list = info["texts"]
+
+    combined_text = "\n\n".join(texts)
+    n = len(texts)
+
+    if n == 1:
+        await message.answer("Анализирую...")
+    else:
+        await message.answer(f"Разбираю {n} сообщений...")
+
+    try:
+        await _run_analysis(
+            message, state,
+            who=data.get("who", "этот человек"),
+            concern=data.get("concern", "подозрительное поведение"),
+            material_label="Переписка:\n",
+            material=combined_text
+        )
+    except Exception as e:
+        await message.answer(friendly_error(e))
 
 
 @dp.message(AnalysisState.waiting_for_material, F.photo)

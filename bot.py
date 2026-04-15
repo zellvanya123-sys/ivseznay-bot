@@ -1185,6 +1185,14 @@ async def flip_sides_cb(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(AnalysisState.post_analysis, F.voice)
 async def post_analysis_voice(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("last_analysis"):
+        await message.answer(
+            "Сначала скинь переписку для анализа.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        return
     await message.answer("Расшифровываю вопрос...")
     try:
         file_info = await bot.get_file(message.voice.file_id)
@@ -1201,12 +1209,40 @@ async def post_analysis_voice(message: Message, state: FSMContext):
     except Exception as e:
         await message.answer(friendly_error(e))
 
+
+@dp.message(AnalysisState.post_analysis, F.video_note)
+async def post_analysis_video_note(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("last_analysis"):
+        await message.answer(
+            "Сначала скинь переписку для анализа.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        return
+    await message.answer("Расшифровываю кружок...")
+    try:
+        file_info = await bot.get_file(message.video_note.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, destination=buf)
+        transcription = await transcribe_audio(buf.getvalue(), "video.mp4")
+        if not transcription.strip():
+            await message.answer("Не смогла разобрать. Напиши текстом.")
+            return
+        message.text = transcription
+        await post_analysis_chat(message, state)
+    except RuntimeError as e:
+        await message.answer(str(e))
+    except Exception as e:
+        await message.answer(friendly_error(e))
+
 # ─── FALLBACK ─────────────────────────────────────────────────────────────────
 
 @dp.message(F.voice | F.video_note)
 async def fallback_audio(message: Message, state: FSMContext):
-    # Голосовое/кружок пришло вне онбординга — просим начать сначала
-    if await state.get_state() is not None:
+    # Только если нет активного состояния — просим начать сначала
+    current_state = await state.get_state()
+    if current_state is not None:
         return
     is_vn = message.video_note is not None
     label = "кружок" if is_vn else "голосовое"

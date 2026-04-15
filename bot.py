@@ -823,6 +823,7 @@ async def _flush_album(mgid: str):
     state: FSMContext = info["state"]
     data: dict      = info["data"]
     photo_ids: list = info["photo_ids"][:5]  # максимум 5 фото за раз
+    force_side = info.get("force_side")
 
     n = len(photo_ids)
     if n == 1:
@@ -855,7 +856,8 @@ async def _flush_album(mgid: str):
                 f"Прочитай все сообщения на всех изображениях.\n"
             ),
             material=extra,
-            images_b64=images_b64
+            images_b64=images_b64,
+            side=force_side or "right"
         )
     except Exception as e:
         await message.answer(friendly_error(e))
@@ -931,11 +933,12 @@ async def analyze_photo(message: Message, state: FSMContext):
         mgid = message.media_group_id
         if mgid not in _album_pending:
             _album_pending[mgid] = {
-                "photo_ids": [],
-                "state":     state,
-                "message":   message,
-                "data":      data,
-                "task":      None,
+                "photo_ids":   [],
+                "state":       state,
+                "message":     message,
+                "data":        data,
+                "task":        None,
+                "force_side":  data.get("force_side"),
             }
         _album_pending[mgid]["photo_ids"].append(message.photo[-1].file_id)
 

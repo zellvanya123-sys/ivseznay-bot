@@ -365,14 +365,14 @@ def friendly_error(e: Exception) -> str:
         if e.status_code in (529, 503):
             return "Сервис временно перегружен. Попробуй через минуту."
         elif e.status_code == 401:
-            return "Проблема с API ключом. Напиши администратору."
+            return "Проблема с API ключом. Напиши @zellvany1"
     elif isinstance(e, anthropic.RateLimitError):
         return "Слишком много запросов. Подожди минуту."
     elif isinstance(e, openai_module.RateLimitError):
         return "На аккаунте OpenAI закончились кредиты. Зайди на platform.openai.com → Billing."
     elif isinstance(e, openai_module.APIStatusError):
         if e.status_code == 401:
-            return "Проблема с API ключом OpenAI. Напиши администратору."
+            return "Проблема с API ключом. Напиши @zellvany1"
         elif e.status_code in (529, 503):
             return "Сервис перегружен. Попробуй через минуту."
         elif e.status_code == 400:
@@ -380,7 +380,7 @@ def friendly_error(e: Exception) -> str:
     elif isinstance(e, openai_module.BadRequestError):
         return "Не удалось расшифровать голосовое. Попробуй ещё раз или напиши текстом."
     elif isinstance(e, openai_module.AuthenticationError):
-        return "Проблема с API ключом OpenAI. Напиши администратору."
+        return "Проблема с API ключом. Напиши @zellvany1"
     elif isinstance(e, openai_module.APIError):
         return "Ошибка сервиса. Попробуй через минуту."
 
@@ -1450,33 +1450,6 @@ async def flip_sides_cb(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.message(AnalysisState.post_analysis, F.voice)
-async def post_analysis_voice(message: Message, state: FSMContext):
-    data = await state.get_data()
-    if not data.get("last_analysis"):
-        await message.answer(
-            "Сначала скинь переписку для анализа.",
-            reply_markup=main_menu()
-        )
-        await state.clear()
-        return
-    await message.answer("Расшифровываю вопрос...")
-    try:
-        file_info = await bot.get_file(message.voice.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(file_info.file_path, destination=buf)
-        transcription = await transcribe_audio(buf.getvalue(), "voice.ogg")
-        if not transcription.strip():
-            await message.answer("Не смогла разобрать. Напиши текстом.")
-            return
-        message.text = transcription
-        await post_analysis_chat(message, state)
-    except RuntimeError as e:
-        await message.answer(str(e))
-    except Exception as e:
-        await message.answer(friendly_error(e))
-
-
 @dp.message(AnalysisState.post_analysis, F.video_note)
 async def post_analysis_video_note(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1520,6 +1493,33 @@ async def fallback_audio(message: Message, state: FSMContext):
     )
 
 
+@dp.message(AnalysisState.post_analysis, F.voice)
+async def post_analysis_voice(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("last_analysis"):
+        await message.answer(
+            "Сначала скинь переписку для анализа.",
+            reply_markup=main_menu()
+        )
+        await state.clear()
+        return
+    await message.answer("Расшифровываю голосовое...")
+    try:
+        file_info = await bot.get_file(message.voice.file_id)
+        buf = io.BytesIO()
+        await bot.download_file(file_info.file_path, destination=buf)
+        transcription = await transcribe_audio(buf.getvalue(), "voice.ogg")
+        if not transcription.strip():
+            await message.answer("Не смогла разобрать. Напиши текстом.")
+            return
+        message.text = transcription
+        await post_analysis_chat(message, state)
+    except RuntimeError as e:
+        await message.answer(str(e))
+    except Exception as e:
+        await message.answer(friendly_error(e))
+
+
 @dp.message(F.text | F.photo)
 async def fallback(message: Message, state: FSMContext):
     if await state.get_state() is None:
@@ -1535,16 +1535,19 @@ async def fallback(message: Message, state: FSMContext):
                 _pending_photos[user_id] = []
             
             _pending_photos[user_id].append(message.photo[-1].file_id)
+            n = len(_pending_photos[user_id])
             
             if is_first:
                 await message.answer(
-                    "Вижу скрин — сейчас разберём.\n\n"
+                    f"Вижу {n} скрин. Сейчас разберём.\n\n"
                     "Потеряла контекст после перезапуска, нужно уточнить пару вещей.",
                     reply_markup=gender_menu()
                 )
             else:
-                n = len(_pending_photos[user_id])
-                await message.answer(f"Скрин {n} запомнила. Выбери пол и кого разбираем.")
+                noun = "скрин" if n == 1 else ("скрина" if 2 <= n <= 4 else "скринов")
+                await message.answer(
+                    f"Вижу {n} {noun}. Жду когда выберешь пол и кого разбираем."
+                )
             return
 
         await message.answer(

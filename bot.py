@@ -267,10 +267,35 @@ GENDER_FORMS = {
 
 class AnalysisState(StatesGroup):
     waiting_for_material = State()
+    waiting_for_situation = State()
     post_analysis = State()
     waiting_for_compare = State()   # сравнение старой переписки с новой
 
 # ─── ПРОМПТЫ ──────────────────────────────────────────────────────────────────
+
+SITUATION_PROMPT = """Ты — эксперт по отношениям и анализу поведения. \
+Говори уверенно, {persona}.
+
+Пользователь: {user_label}
+Кого анализируем: {who} ({who_gender})
+Что беспокоит: {concern}
+
+Описание ситуации:
+{situation}
+
+Проанализируй ситуацию и дай совет. БЕЗ звёздочек и решёток. Только текст и эмодзи.
+
+🔍 ЧТО ПРОИСХОДИТ
+(твой анализ ситуации — что видишь)
+
+⚠️ КЛЮЧЕВЫЕ МОМЕНТЫ
+(2-3 важных момента на которые стоит обратить внимание)
+
+📊 ВЕРДИКТ: Ситуация нормальная / Есть проблемы / Серьёзная проблема
+
+💡 ЧТО ДЕЛАТЬ
+(1-2 конкретных совета — что сделать в ближайшее время)"""
+
 
 ANALYSIS_PROMPT = """Ты — эксперт по анализу манипуляций и лжи в переписке. \
 Говори уверенно, {persona}.
@@ -628,6 +653,14 @@ def after_reply_menu():
     builder.adjust(1)
     return builder.as_markup()
 
+
+def situation_menu():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Описать ситуацию", callback_data="describe_situation")
+    builder.button(text="📷 Скинуть скрин/переписку", callback_data="send_material")
+    builder.adjust(1)
+    return builder.as_markup()
+
 # ─── /START ───────────────────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
@@ -826,9 +859,39 @@ async def choose_concern(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "Жду материал.\n\n"
-        "Скопируй переписку и вставь сюда, отправь скрин или голосовое."
+        "Скинь переписку текстом, скрин или голосовое. "
+        "Или опиши ситуацию своими словами — разберём.",
+        reply_markup=situation_menu()
     )
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "describe_situation")
+async def describe_situation_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AnalysisState.waiting_for_situation)
+    await callback.message.answer(
+        "Опиши ситуацию своими словами.\n\n"
+        "Расскажи что произошло, как ведёт себя человек, что тебя беспокоит."
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "send_material")
+async def send_material_cb(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AnalysisState.waiting_for_material)
+    await callback.message.answer(
+        "Жду переписку — скинь текстом, скрин или голосовое."
+    )
+    await callback.answer()
+
+
+@dp.message(AnalysisState.waiting_for_situation, F.text)
+async def analyze_situation(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if len(message.text) < 20:
+        await message.answer("Опиши подробнее, пожалуйста.")
+        return
+    await _analyze_as_situation(message, state, data, message.text)
 
 
 @dp.callback_query(lambda c: c.data == "ask_question")
@@ -999,6 +1062,53 @@ async def _flush_album(mgid: str):
         await message.answer(friendly_error(e))
 
 
+async def _analyze_as_situation(message: Message, state: FSMContext, data: dict, text: str):
+    """Анализирует текст как описание ситуации."""
+    if is_rate_limited(message.from_user.id):
+        await message.answer("Подожди немного перед следующим запросом.")
+        return
+    
+    user_gender = data.get("user_gender", "female")
+    gf = GENDER_FORMS.get(user_gender, GENDER_FORMS["female"])
+    user_label = "мужчина" if user_gender == "male" else "женщина"
+    who_gender = WHO_GENDER.get(data.get("who", ""), "пол неизвестен")
+    
+    await message.answer("Анализирую ситуацию...")
+    
+    try:
+        prompt = SITUATION_PROMPT.format(
+            persona=gf["persona"],
+            user_label=user_label,
+            who=data.get("who", "этот человек"),
+            who_gender=who_gender,
+            concern=data.get("concern", ""),
+            situation=text
+        )
+        
+        response = await claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = clean_markdown(response.content[0].text)
+        
+        await increment_requests(message.from_user.id)
+        await update_last_interaction(message.from_user.id)
+        await state.set_state(AnalysisState.post_analysis)
+        await state.update_data(
+            who=data.get("who"),
+            concern=data.get("concern"),
+            last_analysis=result,
+            user_gender=user_gender,
+            is_photo=False,
+            questions_count=0,
+            chat_history=[]
+        )
+        await send_long(message, result, reply_markup=after_menu(data.get("who", ""), show_flip=False))
+    except Exception as e:
+        await message.answer(friendly_error(e))
+
+
 async def _run_analysis(message: Message, state: FSMContext,
                         who: str, concern: str,
                         material_label: str, material: str,
@@ -1040,7 +1150,6 @@ async def _run_analysis(message: Message, state: FSMContext,
 @dp.message(AnalysisState.waiting_for_material, F.text)
 async def analyze_text(message: Message, state: FSMContext):
     data = await state.get_data()
-    # Онбординг не завершён — кто и что беспокоит неизвестны
     if not data.get("who"):
         await message.answer(
             "Сначала выбери кого разбираем — нажми «Начать анализ».",
@@ -1051,6 +1160,11 @@ async def analyze_text(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
     now = time.time()
+
+    # Длинный текст (описание ситуации) — анализируем сразу как ситуацию
+    if len(message.text) > 100 and len(message.text) <= 8000:
+        await _analyze_as_situation(message, state, data, message.text)
+        return
 
     # Группируем текст в течение 3 сек
     if user_id in _text_pending:

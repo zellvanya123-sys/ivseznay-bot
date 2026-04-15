@@ -312,6 +312,19 @@ def friendly_error(e: Exception) -> str:
         return "Слишком много запросов. Подожди минуту."
     elif isinstance(e, openai_module.RateLimitError):
         return "На аккаунте OpenAI закончились кредиты. Зайди на platform.openai.com → Billing."
+    elif isinstance(e, openai_module.APIStatusError):
+        if e.status_code == 401:
+            return "Проблема с API ключом OpenAI. Напиши администратору."
+        elif e.status_code in (529, 503):
+            return "Сервис перегружен. Попробуй через минуту."
+        elif e.status_code == 400:
+            return "Не удалось расшифровать голосовое. Попробуй ещё раз или напиши текстом."
+    elif isinstance(e, openai_module.BadRequestError):
+        return "Не удалось расшифровать голосовое. Попробуй ещё раз или напиши текстом."
+    elif isinstance(e, openai_module.AuthenticationError):
+        return "Проблема с API ключом OpenAI. Напиши администратору."
+    elif isinstance(e, openai_module.APIError):
+        return "Ошибка сервиса. Попробуй через минуту."
 
     return "Что-то пошло не так. Попробуй ещё раз."
 
@@ -342,19 +355,20 @@ async def send_long(message: Message, text: str, **kwargs):
 
 async def transcribe_audio(file_bytes: bytes, filename: str) -> str:
     if not openai_client:
-        raise RuntimeError("Голосовые не настроены. Добавь OPENAI_API_KEY на Railway.")
+        raise RuntimeError("Голосовые не настроены. Добавь OPENAI_API_KEY.")
     buf = io.BytesIO(file_bytes)
+    buf.seek(0)
+    ext = filename.rsplit(".", 1)[-1] if "." in filename else "ogg"
     try:
         transcript = await openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=(filename, buf),
-            language="ru"
         )
         return transcript.text
     except openai.RateLimitError:
         raise RuntimeError(
             "На аккаунте OpenAI закончились кредиты. "
-            "Зайди на platform.openai.com → Billing и пополни баланс."
+            "Зайди на platform.openai.com → Billing."
         )
 
 

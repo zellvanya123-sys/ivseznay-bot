@@ -29,8 +29,12 @@ _openai_key = os.getenv("OPENAI_API_KEY")
 openai_client = openai.AsyncOpenAI(api_key=_openai_key) if _openai_key else None
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = os.getenv("ADMIN_ID", "0")
 FREE_LIMIT = 3
 COUNTER_SEED = 8341
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не установлен! Добавь DATABASE_URL в переменные окружения.")
 
 _pool = None
 
@@ -700,6 +704,35 @@ async def help_cmd(message: Message, state: FSMContext):
 async def reset_cmd(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Сброшено. Начинай заново.", reply_markup=main_menu())
+
+
+@dp.message(Command("chatid"))
+async def chatid_cmd(message: Message):
+    await message.answer(f"Твой ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: Message):
+    if message.from_user.id != int(os.getenv("ADMIN_ID", "0")):
+        await message.answer("Эта команда только для администратора.")
+        return
+    
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            users = await conn.fetchval("SELECT COUNT(*) FROM users")
+            analyses = await conn.fetchval("SELECT COUNT(*) FROM analyses")
+            total = await conn.fetchval("SELECT value FROM stats WHERE key = 'total_analyses'")
+        
+        await message.answer(
+            f"📊 Статистика бота:\n\n"
+            f"👥 Пользователей: {users}\n"
+            f"🔍 Анализов: {analyses}\n"
+            f"📈 Всего разобрано: {total}"
+        )
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
 
 # ─── КОЛБЭКИ: ОНБОРДИНГ ───────────────────────────────────────────────────────
 

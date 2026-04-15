@@ -770,10 +770,12 @@ async def choose_concern(callback: CallbackQuery, state: FSMContext):
             pending_photos = [pending_photos]
         
         n = len(pending_photos)
-        if n == 1:
-            await callback.message.answer("Анализирую скрин...")
-            fresh = await state.get_data()
-            try:
+        noun = "скрин" if n == 1 else ("скрина" if 2 <= n <= 4 else "скринов")
+        await callback.message.answer(f"Вижу {n} {noun}. Разбираю...")
+        
+        fresh = await state.get_data()
+        try:
+            if n == 1:
                 image_b64 = await _download_photo(pending_photos[0])
                 await _run_analysis(
                     callback.message, state,
@@ -783,23 +785,29 @@ async def choose_concern(callback: CallbackQuery, state: FSMContext):
                     material="",
                     image_b64=image_b64
                 )
-            except Exception as e:
-                await callback.message.answer(friendly_error(e))
-            await callback.answer()
-        else:
-            # Несколько фото — запускаем группировку
-            await callback.message.answer(f"Анализирую {n} скриншотов...")
-            _single_photo_pending[user_id] = {
-                "photo_ids":  pending_photos,
-                "state":      state,
-                "message":    callback.message,
-                "data":       await state.get_data(),
-                "force_side": "right",
-                "caption":    None,
-                "task":       None,
-                "time":       time.time(),
-            }
-            _single_photo_pending[user_id]["task"] = asyncio.create_task(_flush_single_photos(user_id))
+            else:
+                # Несколько фото — анализируем сразу вместе
+                images_b64 = []
+                for fid in pending_photos:
+                    try:
+                        images_b64.append(await _download_photo(fid))
+                    except Exception:
+                        pass
+                
+                if images_b64:
+                    await _run_analysis(
+                        callback.message, state,
+                        who=fresh.get("who", "этот человек"),
+                        concern=fresh.get("concern", "подозрительное поведение"),
+                        material_label=f"На {n} скриншотах — переписка. Прочитай все.\n",
+                        material="",
+                        images_b64=images_b64
+                    )
+                else:
+                    await callback.message.answer("Не получилось скачать скрины. Попробуй ещё раз.")
+        except Exception as e:
+            await callback.message.answer(friendly_error(e))
+        await callback.answer()
         return
 
     await callback.message.answer(

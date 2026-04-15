@@ -3,8 +3,10 @@ import base64
 import io
 import os
 import re
-import aiosqlite
+import time
+from contextlib import asynccontextmanager
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -26,164 +28,167 @@ claude = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 _openai_key = os.getenv("OPENAI_API_KEY")
 openai_client = openai.AsyncOpenAI(api_key=_openai_key) if _openai_key else None
 
-DB_PATH = "bot.db"
-FREE_LIMIT = 3          # бесплатных анализов
-COUNTER_SEED = 8341     # стартовый счётчик для соцдоказательства
+DATABASE_URL = os.getenv("DATABASE_URL")
+FREE_LIMIT = 3
+COUNTER_SEED = 8341
 
-# ─── БАЗА ДАННЫХ ──────────────────────────────────────────────────────────────
+_pool = None
+
+async def get_pool():
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    return _pool
+
+
+async def close_pool():
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
+                telegram_id BIGINT PRIMARY KEY,
                 requests_count INTEGER DEFAULT 0,
                 is_subscribed INTEGER DEFAULT 0,
-                last_interaction INTEGER DEFAULT 0,
+                last_interaction BIGINT DEFAULT 0,
                 reminder_sent INTEGER DEFAULT 0
             )
         """)
-        # Миграция: добавляем колонки если их нет
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN last_interaction INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN reminder_sent INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT,
                 who TEXT,
                 concern TEXT,
                 analysis_text TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        await db.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 key TEXT PRIMARY KEY,
                 value INTEGER DEFAULT 0
             )
         """)
-        # Засеиваем счётчик если первый запуск
-        await db.execute(
-            "INSERT OR IGNORE INTO stats (key, value) VALUES ('total_analyses', ?)",
-            (COUNTER_SEED,)
-        )
-        await db.commit()
+        await conn.execute("""
+            INSERT INTO stats (key, value)
+            VALUES ('total_analyses', $1)
+            ON CONFLICT (key) DO NOTHING
+        """, COUNTER_SEED)
 
 
 async def get_user(telegram_id: int) -> dict:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT requests_count, is_subscribed FROM users WHERE telegram_id = ?",
-                (telegram_id,)
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    return {"requests_count": row[0], "is_subscribed": row[1]}
-                return {"requests_count": 0, "is_subscribed": 0}
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT requests_count, is_subscribed FROM users WHERE telegram_id = $1",
+                telegram_id
+            )
+            if row:
+                return {"requests_count": row["requests_count"], "is_subscribed": row["is_subscribed"]}
+            return {"requests_count": 0, "is_subscribed": 0}
     except Exception:
         return {"requests_count": 0, "is_subscribed": 0}
 
 
 async def increment_requests(telegram_id: int):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
                 INSERT INTO users (telegram_id, requests_count, last_interaction)
-                VALUES (?, 1, ?)
-                ON CONFLICT(telegram_id) DO UPDATE SET requests_count = requests_count + 1, last_interaction = ?
-            """, (telegram_id, int(time.time()), int(time.time())))
-            await db.execute(
+                VALUES ($1, 1, $2)
+                ON CONFLICT (telegram_id) DO UPDATE SET
+                    requests_count = users.requests_count + 1,
+                    last_interaction = $2
+            """, telegram_id, int(time.time()))
+            await conn.execute(
                 "UPDATE stats SET value = value + 1 WHERE key = 'total_analyses'"
             )
-            await db.commit()
     except Exception:
         pass
 
 
 async def update_last_interaction(telegram_id: int):
-    """Обновляем время последнего взаимодействия."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET last_interaction = ?, reminder_sent = 0 WHERE telegram_id = ?",
-                (int(time.time()), telegram_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_interaction = $1, reminder_sent = 0 WHERE telegram_id = $2",
+                int(time.time()), telegram_id
             )
-            await db.commit()
     except Exception:
         pass
 
 
 async def get_users_for_reminder(hours: int = 2) -> list:
-    """Получаем пользователей, которым нужно отправить напоминание."""
     try:
+        pool = await get_pool()
         cutoff = int(time.time()) - (hours * 3600)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("""
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
                 SELECT telegram_id FROM users
                 WHERE last_interaction > 0
-                AND last_interaction < ?
+                AND last_interaction < $1
                 AND reminder_sent = 0
                 AND is_subscribed = 0
-            """, (cutoff,)) as cur:
-                rows = await cur.fetchall()
-                return [row[0] for row in rows]
+            """, cutoff)
+            return [row["telegram_id"] for row in rows]
     except Exception:
         return []
 
 
 async def mark_reminder_sent(telegram_id: int):
-    """Отмечаем что напоминание отправлено."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET reminder_sent = 1 WHERE telegram_id = ?",
-                (telegram_id,)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET reminder_sent = 1 WHERE telegram_id = $1",
+                telegram_id
             )
-            await db.commit()
     except Exception:
         pass
 
 
 async def save_analysis(telegram_id: int, who: str, concern: str, text: str):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO analyses (telegram_id, who, concern, analysis_text) VALUES (?,?,?,?)",
-                (telegram_id, who, concern, text)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO analyses (telegram_id, who, concern, analysis_text) VALUES ($1, $2, $3, $4)",
+                telegram_id, who, concern, text
             )
-            await db.commit()
     except Exception:
-        pass  # Silently log but don't crash
+        pass
 
 
 async def get_history(telegram_id: int, limit: int = 3) -> list:
-    """Последние N анализов пользователя для сравнения динамики."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
             SELECT who, concern, analysis_text, created_at
             FROM analyses
-            WHERE telegram_id = ?
+            WHERE telegram_id = $1
             ORDER BY created_at DESC
-            LIMIT ?
-        """, (telegram_id, limit)) as cur:
-            rows = await cur.fetchall()
-            return [{"who": r[0], "concern": r[1], "analysis": r[2], "date": r[3]}
-                    for r in rows]
+            LIMIT $2
+        """, telegram_id, limit)
+        return [{"who": r["who"], "concern": r["concern"], "analysis": r["analysis_text"], "date": r["created_at"]}
+                for r in rows]
 
 
 async def get_total_analyses() -> int:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT value FROM stats WHERE key='total_analyses'") as cur:
-                row = await cur.fetchone()
-                return row[0] if row else COUNTER_SEED
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM stats WHERE key='total_analyses'")
+            return row["value"] if row else COUNTER_SEED
     except Exception:
         return COUNTER_SEED
 
@@ -1656,9 +1661,12 @@ async def send_reminders():
 
 
 async def main():
-    await init_db()
-    asyncio.create_task(send_reminders())
-    await dp.start_polling(bot)
+    try:
+        await init_db()
+        asyncio.create_task(send_reminders())
+        await dp.start_polling(bot)
+    finally:
+        await close_pool()
 
 if __name__ == "__main__":
     asyncio.run(main())
